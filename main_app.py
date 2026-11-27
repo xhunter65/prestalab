@@ -15,7 +15,7 @@ logger = logging.getLogger("prestalab")
 AWS_REGION = os.getenv("AWS_REGION", "mx-central-1")
 SECRET_NAME = os.getenv("SECRET_NAME", "prestalab/prod/rds-credentials")
 
-app = FastAPI(title="PrestaLab API", version="2.0.0")
+app = FastAPI(title="PrestaLab API", version="2.1.0")
 
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 STARTUP_SECRET_VERSION: str | None = None
@@ -48,7 +48,7 @@ def fetch_rds_credentials() -> dict:
 
 
 def check_postgres_tls(creds: dict) -> dict:
-    """Verifica conectividad TLS (sslmode=require) contra RDS PostgreSQL usando credenciales de Secrets Manager."""
+    """Verifica conectividad TLS real (sslmode=require) contra RDS PostgreSQL usando pg_stat_ssl."""
     conn = None
     try:
         conn = psycopg2.connect(
@@ -58,22 +58,27 @@ def check_postgres_tls(creds: dict) -> dict:
             user=creds["username"],
             password=creds["password"],
             sslmode="require",
-            connect_timeout=3,
+            connect_timeout=5,
         )
         with conn.cursor() as cur:
-            cur.execute("SELECT version(), ssl_is_used();")
-            pg_version, ssl_used = cur.fetchone()
+            cur.execute(
+                "SELECT version(), s.ssl, s.version "
+                "FROM pg_stat_ssl s WHERE s.pid = pg_backend_pid();"
+            )
+            pg_version, ssl_used, tls_version = cur.fetchone()
         return {
             "status": "connected",
             "tls_mode": "require",
             "ssl_active": bool(ssl_used),
+            "tls_version": tls_version,
             "engine_version": pg_version,
         }
     except Exception as exc:
         return {
             "status": "unreachable",
             "tls_mode": "require",
-            "detail": type(exc).__name__,
+            "ssl_active": False,
+            "detail": f"{type(exc).__name__}: {str(exc).splitlines()[0]}",
         }
     finally:
         if conn is not None:
@@ -95,8 +100,9 @@ def build_status_payload() -> dict:
     creds = fetch_rds_credentials()
     db_check = check_postgres_tls(creds)
     return {
-        "status": "ok",
+        "status": "ok" if db_check["status"] == "connected" else "degraded",
         "service": "Presta-Lab API",
+        "version": "2.1.0",
         "credentials_source": "AWS Secrets Manager (runtime via boto3)",
         "secret_name": SECRET_NAME,
         "aws_region": AWS_REGION,
